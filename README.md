@@ -1,5 +1,6 @@
 # HAMPTER Core Server
 ![HAMPTER](./hampter.png)
+
 Core Server is the central engine of HAMPTER.  
 It converts MQTT-connected devices into **MCP Tools that LLMs can use**, and manages data flow between devices.
 
@@ -228,5 +229,6 @@ core_server/
 1. Check MQTT connection: `mosquitto_sub -t "mcp/#" -v`
 2. Ensure device is sending announce messages
 3. Check Bridge logs: `docker logs mcp-bridge`
+
 
 
