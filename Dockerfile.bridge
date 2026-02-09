@@ -1,0 +1,32 @@
+# 최소 이미지
+FROM python:3.11-slim
+
+# 런타임 필수 패키지
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    paho-mqtt \
+    requests \
+    mcp \
+    fastmcp
+
+# 앱 배치
+WORKDIR /app
+COPY port_routing.py /app/port_routing.py
+COPY bridge_mcp /app/bridge_mcp
+COPY run_bridge.py /app/run_bridge.py
+
+# 기본 환경변수 (docker-compose에서 덮어쓸 수 있음)
+ENV MQTT_HOST=mcp-broker \
+    MQTT_PORT=1883 \
+    KEEPALIVE=60 \
+    API_PORT=8083 \
+    AUTO_PORT_FALLBACK=0 \
+    CMD_TIMEOUT_MS=8000 \
+    DEBUG_SUB_ALL=0 \
+    PROJECTION_CONFIG_PATH=/app/config/projection_config.json \
+    ROUTING_CONFIG_PATH=/app/config/routing_config.json
+
+EXPOSE 8083
+
+CMD ["python", "-u", "run_bridge.py"]
