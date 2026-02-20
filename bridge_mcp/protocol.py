@@ -45,7 +45,7 @@ class ProtocolHandler:
                 # Try to guess leaf? Unsafe.
                 # In current SABA, topic always contains ID.
             else:
-                return
+                return ("invalid_topic", None)
 
         # 2. Add Protocol Metadata
         # We might want to track which protocol a device is using
@@ -66,7 +66,8 @@ class ProtocolHandler:
         elif leaf == "events":
             rid = payload.get("request_id")
             if rid:
-                self.cmd_waiter.resolve(rid, payload)
+                # Bind response resolution to announcing device to reduce cross-device mismatch.
+                self.cmd_waiter.resolve(rid, payload, device_id=dev_id)
             return ("events", rid)
 
         elif leaf == "ports/announce":
@@ -79,6 +80,8 @@ class ProtocolHandler:
             if port_name is not None:
                 try:
                     val = float(value)
+                    if not self.port_router:
+                        return ("ports_data", None)
                     routed = self.port_router.route(dev_id, port_name, val)
                     # log(f"[PROTOCOL] Routed {dev_id}/{port_name} ({val}) -> {routed} targets")
                     return ("routed", routed)

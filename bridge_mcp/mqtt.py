@@ -49,6 +49,17 @@ def publish_to_inport(device_id: str, port_name: str, value: float) -> bool:
     except Exception as e:
         return False
 
+def publish_claim_token(device_id: str, token: str) -> bool:
+    claim_topic = f"mcp/dev/{device_id}/claim"
+    claim_payload = {"token": token}
+    try:
+        pub = get_mqtt_pub_client()
+        pub.publish(claim_topic, json.dumps(claim_payload), qos=1, retain=False)
+        return True
+    except Exception as e:
+        log(f"[CLAIM] Failed to publish claim token for {device_id}: {e}")
+        return False
+
 def start_mqtt_listener(device_store: DeviceStore, cmd_waiter: CommandWaiter, port_store, port_router):
     
     # Unified Protocol Handler
@@ -94,20 +105,25 @@ def start_mqtt_listener(device_store: DeviceStore, cmd_waiter: CommandWaiter, po
                 
                 # Extended Logic: Claiming (MQTT Specific)
                 if action == "announce" and dev_id:
-                     # Check if device needs claiming
-                    if not device_store.get_token(dev_id):
+                    # Ensure every announce is paired with a claim token push.
+                    # This makes reboot/reset recovery deterministic.
+                    token = device_store.get_token(dev_id)
+                    if not token:
                         token = generate_token()
                         device_store.set_token(dev_id, token)
-                        
-                        claim_topic = f"mcp/dev/{dev_id}/claim"
-                        claim_payload = {"token": token}
-                        
-                        try:
-                            pub = get_mqtt_pub_client()
-                            pub.publish(claim_topic, json.dumps(claim_payload), qos=1, retain=False)
-                            log(f"[CLAIM] Sent new token to {dev_id}")
-                        except Exception as e:
-                            log(f"[CLAIM] Failed to send token: {e}")
+                        log(f"[CLAIM] Generated new token for {dev_id}")
+                    if publish_claim_token(dev_id, token):
+                        log(f"[CLAIM] Sent claim token to {dev_id}")
+
+                # If device reports wrong token, rotate and re-claim immediately.
+                if action == "events" and dev_id:
+                    err = payload.get("error") or {}
+                    code = err.get("code")
+                    if code == "wrong_token":
+                        new_token = generate_token()
+                        device_store.set_token(dev_id, new_token)
+                        log(f"[CLAIM] Rotated token due to wrong_token for {dev_id}")
+                        publish_claim_token(dev_id, new_token)
 
             except Exception as e:
                 log(f"[mqtt] Error handling message: {e}")

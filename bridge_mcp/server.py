@@ -20,6 +20,7 @@ class BridgeServer:
                  port_store: PortStore,
                  routing_matrix: RoutingMatrix,
                  port_router,
+                 command_service=None,
                  ipc_agent=None,
                  virtual_tool_store=None,
                  virtual_tool_executor=None):
@@ -31,6 +32,7 @@ class BridgeServer:
         self.port_store = port_store
         self.routing_matrix = routing_matrix
         self.port_router = port_router
+        self.command_service = command_service
         self.ipc_agent = ipc_agent
         self.virtual_tool_store = virtual_tool_store
         self.virtual_tool_executor = virtual_tool_executor
@@ -142,7 +144,18 @@ class BridgeServer:
             if d and not d.get("online", False):
                 return [TextContent(type="text", text=f"Error: Device {device_id} is offline")]
 
-            ok, resp = publish_cmd(self.device_store, self.cmd_waiter, get_mqtt_pub_client(), device_id, tool, args, ipc_agent=self.ipc_agent)
+            if self.command_service:
+                ok, resp = self.command_service.execute(device_id, tool, args)
+            else:
+                ok, resp = publish_cmd(
+                    self.device_store,
+                    self.cmd_waiter,
+                    get_mqtt_pub_client(),
+                    device_id,
+                    tool,
+                    args,
+                    ipc_agent=self.ipc_agent,
+                )
             if not ok:
                 error_msg = resp.get("error", {}).get("message", "Unknown error")
                 return [TextContent(type="text", text=f"Error: {error_msg}")]
@@ -281,7 +294,10 @@ class BridgeServer:
                 warnings.append(f"Warning: Target '{target}' not found in announced inports")
             
             # 연결 생성
-            conn = self.routing_matrix.connect(source, target, transform, enabled=True, description=description)
+            try:
+                conn = self.routing_matrix.connect(source, target, transform, enabled=True, description=description)
+            except ValueError as e:
+                return [TextContent(type="text", text=f"✗ Invalid connection: {e}")]
             
             result_lines = [f"✓ Connected: {source} → {target}"]
             if transform:
@@ -422,7 +438,18 @@ class BridgeServer:
 
                         log(f"[PROJECTED_TOOL] {projected_tool_copy['name']} ({original_tool_name_copy}) called with args: {json.dumps(args, indent=2)}")
                         
-                        ok, resp = publish_cmd(self.device_store, self.cmd_waiter, get_mqtt_pub_client(), device_id_copy, original_tool_name_copy, args, ipc_agent=self.ipc_agent)
+                        if self.command_service:
+                            ok, resp = self.command_service.execute(device_id_copy, original_tool_name_copy, args)
+                        else:
+                            ok, resp = publish_cmd(
+                                self.device_store,
+                                self.cmd_waiter,
+                                get_mqtt_pub_client(),
+                                device_id_copy,
+                                original_tool_name_copy,
+                                args,
+                                ipc_agent=self.ipc_agent,
+                            )
                         
                         if not ok:
                             error_msg = resp.get("error", {}).get("message", "Unknown error")

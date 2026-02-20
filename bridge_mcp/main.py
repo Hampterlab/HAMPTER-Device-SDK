@@ -5,17 +5,9 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from http import HTTPStatus
 
-from .config import PROJECTION_CONFIG_PATH, ROUTING_CONFIG_PATH, VIRTUAL_TOOLS_CONFIG_PATH, API_PORT, MQTT_HOST, MQTT_PORT, KEEPALIVE
+from .config import PROJECTION_CONFIG_PATH, ROUTING_CONFIG_PATH, API_PORT, MQTT_HOST, MQTT_PORT, KEEPALIVE
 from .utils import log, now_iso
-from .tool_projection import ToolProjectionStore
-from .tool_registry import DynamicToolRegistry
-from .device_store import DeviceStore
-from .command import CommandWaiter
-from .mqtt import start_mqtt_listener, publish_to_inport, get_mqtt_pub_client
-from .ipc import IPCAgent
-from .server import BridgeServer
-from .virtual_tool import VirtualToolStore, VirtualToolExecutor
-from port_routing import PortStore, RoutingMatrix, PortRouter
+from bridge_v2 import build_runtime_context
 
 def pick_free_port(base: int, tries: int) -> int | None:
     for p in range(base, base + tries):
@@ -29,61 +21,11 @@ def pick_free_port(base: int, tries: int) -> int | None:
     return None
 
 def main():
-    # 1. Initialize Stores
-    projection_store = ToolProjectionStore(PROJECTION_CONFIG_PATH)
-    tool_registry = DynamicToolRegistry(projection_store)
-    device_store = DeviceStore(tool_registry)
-    cmd_waiter = CommandWaiter()
-    port_store = PortStore()
-    routing_matrix = RoutingMatrix(ROUTING_CONFIG_PATH)
-    virtual_tool_store = VirtualToolStore(VIRTUAL_TOOLS_CONFIG_PATH)
-    
-    # 3. Initialize IPC Agent (needed for publisher)
-    ipc_agent = IPCAgent(device_store, cmd_waiter, port_store, None) # router passed later
-    
-    # Define Hybrid Publisher
-    def hybrid_publish(device_id: str, port: str, value: float) -> bool:
-        d = device_store.get(device_id)
-        if d and d.get("protocol") == 'ipc':
-            return ipc_agent.send_port_set(device_id, port, value)
-        return publish_to_inport(device_id, port, value)
-
-    # 2. Initialize Port Router
-    port_router = PortRouter(routing_matrix, hybrid_publish)
-    
-    # Update IPC Agent with router
-    ipc_agent.port_router = port_router
-    # CRITICAL: Also update the protocol handler's router (it was created with None!)
-    ipc_agent.protocol.port_router = port_router
-    
-    # 3b. Start IPC Agent (start thread)
-    ipc_agent.start()
-    
-    # 3c. Start MQTT Listener
-    start_mqtt_listener(device_store, cmd_waiter, port_store, port_router)
-    
-    # 4. Initialize Virtual Tool Executor
-    virtual_tool_executor = VirtualToolExecutor(
-        virtual_tool_store, device_store, cmd_waiter, get_mqtt_pub_client, ipc_agent
-    )
-    
-    # 5. Initialize Bridge Server (MCP)
-    server = BridgeServer(
-        device_store, 
-        projection_store, 
-        tool_registry, 
-        cmd_waiter, 
-        port_store, 
-        routing_matrix,
-        port_router,
-        ipc_agent=ipc_agent,
-        virtual_tool_store=virtual_tool_store,
-        virtual_tool_executor=virtual_tool_executor
-    )
-    
-    # Register existing devices and virtual tools
-    server.register_all_announced_devices()
-    server.register_virtual_tools()
+    ctx = build_runtime_context()
+    server = ctx.bridge_server
+    port_store = ctx.port_store
+    routing_service = ctx.routing_service
+    device_sessions = ctx.device_sessions
     
     # 5. Initialize FastAPI App
     app = FastAPI(title="Bridge MCP (SSE + Port Routing API)")
@@ -96,12 +38,12 @@ def main():
     @app.get("/devices")
     def get_devices_api():
         """Get devices list"""
-        return device_store.list()
+        return device_sessions.list_devices()
 
     @app.get("/devices/{device_id}")
     def get_device_api(device_id: str):
         """Get specific device"""
-        d = device_store.get(device_id)
+        d = device_sessions.get_device(device_id)
         if not d:
             raise HTTPException(HTTPStatus.NOT_FOUND, "device not found")
         return d
@@ -128,12 +70,12 @@ def main():
     @app.get("/routing")
     def get_routing_api():
         """Get routing matrix"""
-        return routing_matrix.get_matrix_view(port_store)
+        return routing_service.get_matrix()
 
     @app.get("/routing/connections")
     def get_connections_api():
         """Get all connections"""
-        return routing_matrix.get_all_connections()
+        return routing_service.get_connections()
 
     @app.post("/routing/connect")
     def connect_api(data: dict):
@@ -147,7 +89,10 @@ def main():
         if not source or not target:
             raise HTTPException(HTTPStatus.BAD_REQUEST, "source and target required")
         
-        conn = routing_matrix.connect(source, target, transform, enabled, description)
+        try:
+            conn = routing_service.connect(source, target, transform, enabled, description)
+        except ValueError as e:
+            raise HTTPException(HTTPStatus.BAD_REQUEST, str(e))
         return {"ok": True, "connection": conn}
 
     @app.post("/routing/disconnect")
@@ -157,11 +102,9 @@ def main():
         target = data.get("target")
         connection_id = data.get("connection_id")
         
-        if connection_id:
-            success = routing_matrix.disconnect_by_id(connection_id)
-        elif source and target:
-            success = routing_matrix.disconnect(source, target)
-        else:
+        try:
+            success = routing_service.disconnect(source, target, connection_id)
+        except ValueError:
             raise HTTPException(HTTPStatus.BAD_REQUEST, "source/target or connection_id required")
         
         return {"ok": success}
@@ -169,7 +112,7 @@ def main():
     @app.put("/routing/connection/{connection_id}")
     def update_connection_api(connection_id: str, data: dict):
         """Update a connection"""
-        conn = routing_matrix.update_connection(connection_id, data)
+        conn = routing_service.update_connection(connection_id, data)
         if not conn:
             raise HTTPException(HTTPStatus.NOT_FOUND, "connection not found")
         return {"ok": True, "connection": conn}
@@ -180,7 +123,7 @@ def main():
         try:
             # 1. Reload raw config from disk
             server.projection_store.reload_config()
-            virtual_tool_store.reload_config()
+            ctx.virtual_tool_store.reload_config()
             
             # 2. Reset and Re-register tools
             server.reset_tools()
@@ -200,12 +143,12 @@ def main():
     @app.get("/virtual-tools")
     def get_virtual_tools_api():
         """Get all virtual tools"""
-        return virtual_tool_store.get_all_virtual_tools()
+        return ctx.virtual_tool_store.get_all_virtual_tools()
 
     @app.get("/virtual-tools/{name}")
     def get_virtual_tool_api(name: str):
         """Get a specific virtual tool"""
-        vt = virtual_tool_store.get_virtual_tool(name)
+        vt = ctx.virtual_tool_store.get_virtual_tool(name)
         if not vt:
             raise HTTPException(HTTPStatus.NOT_FOUND, "virtual tool not found")
         return vt
@@ -221,7 +164,7 @@ def main():
             "description": data.get("description", ""),
             "bindings": data.get("bindings", [])
         }
-        success = virtual_tool_store.create_virtual_tool(name, tool_def)
+        success = ctx.virtual_tool_store.create_virtual_tool(name, tool_def)
         if success:
             # Re-register virtual tools after creation
             server.register_virtual_tools()
@@ -235,7 +178,7 @@ def main():
             "description": data.get("description", ""),
             "bindings": data.get("bindings", [])
         }
-        success = virtual_tool_store.update_virtual_tool(name, tool_def)
+        success = ctx.virtual_tool_store.update_virtual_tool(name, tool_def)
         if success:
             server.register_virtual_tools()
             return {"ok": True, "message": f"Virtual tool '{name}' updated"}
@@ -244,7 +187,7 @@ def main():
     @app.delete("/virtual-tools/{name}")
     def delete_virtual_tool_api(name: str):
         """Delete a virtual tool"""
-        success = virtual_tool_store.delete_virtual_tool(name)
+        success = ctx.virtual_tool_store.delete_virtual_tool(name)
         if success:
             server.reset_tools()
             server.register_all_announced_devices()
@@ -255,7 +198,7 @@ def main():
     @app.get("/routing/stats")
     def get_routing_stats_api():
         """Get routing statistics"""
-        return port_router.get_stats()
+        return routing_service.get_stats()
     
     # Mount MCP SSE endpoint
     try:

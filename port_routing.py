@@ -9,6 +9,7 @@ Port Routing System - InPort ↔ OutPort 연결 관리
 import os
 import json
 import threading
+import queue
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Callable
 from pathlib import Path
@@ -148,8 +149,40 @@ class RoutingMatrix:
     def __init__(self, config_path: str):
         self.config_path = config_path
         self._connections: List[Dict[str, Any]] = []
+        self._targets_by_source: Dict[str, List[Dict[str, Any]]] = {}
         self._lock = threading.Lock()
         self.load_config()
+
+    def _rebuild_index(self):
+        idx: Dict[str, List[Dict[str, Any]]] = {}
+        for conn in self._connections:
+            source = conn.get("source")
+            if not source:
+                continue
+            idx.setdefault(source, []).append({
+                "target": conn.get("target"),
+                "transform": conn.get("transform", {}),
+                "enabled": conn.get("enabled", True)
+            })
+        self._targets_by_source = idx
+
+    def _has_path(self, start: str, goal: str, visited: Optional[set] = None) -> bool:
+        """Simple DFS on current routing graph to detect cycles."""
+        if start == goal:
+            return True
+        if visited is None:
+            visited = set()
+        if start in visited:
+            return False
+        visited.add(start)
+
+        for edge in self._targets_by_source.get(start, []):
+            nxt = edge.get("target")
+            if not nxt:
+                continue
+            if self._has_path(nxt, goal, visited):
+                return True
+        return False
     
     def load_config(self):
         """설정 파일에서 라우팅 매트릭스 로드"""
@@ -158,14 +191,17 @@ class RoutingMatrix:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self._connections = data.get("connections", [])
+                self._rebuild_index()
                 log(f"[ROUTING] Loaded {len(self._connections)} connections from {self.config_path}")
             else:
                 self._connections = []
+                self._rebuild_index()
                 self.save_config()
                 log(f"[ROUTING] Created empty routing config at {self.config_path}")
         except Exception as e:
             log(f"[ROUTING] Error loading config: {e}")
             self._connections = []
+            self._rebuild_index()
     
     def save_config(self):
         """라우팅 매트릭스를 파일에 저장"""
@@ -200,6 +236,13 @@ class RoutingMatrix:
             생성된 연결 정보
         """
         with self._lock:
+            if "/" not in source_port_id or "/" not in target_port_id:
+                raise ValueError("source/target must be in 'device_id/port_name' format")
+            if source_port_id == target_port_id:
+                raise ValueError("source and target cannot be identical")
+            if self._has_path(target_port_id, source_port_id):
+                raise ValueError("connection would create a routing cycle")
+
             # 중복 체크
             for conn in self._connections:
                 if conn["source"] == source_port_id and conn["target"] == target_port_id:
@@ -217,6 +260,7 @@ class RoutingMatrix:
             }
             
             self._connections.append(connection)
+            self._rebuild_index()
             self.save_config()
             
             # log(f"[ROUTING] Connected: {source_port_id} → {target_port_id}")
@@ -232,6 +276,7 @@ class RoutingMatrix:
             ]
             
             if len(self._connections) < original_len:
+                self._rebuild_index()
                 self.save_config()
                 # log(f"[ROUTING] Disconnected: {source_port_id} → {target_port_id}")
                 return True
@@ -246,6 +291,7 @@ class RoutingMatrix:
             self._connections = [c for c in self._connections if c["id"] != connection_id]
             
             if len(self._connections) < original_len:
+                self._rebuild_index()
                 self.save_config()
                 # log(f"[ROUTING] Disconnected by ID: {connection_id}")
                 return True
@@ -263,6 +309,7 @@ class RoutingMatrix:
                     if "description" in updates:
                         conn["description"] = updates["description"]
                     conn["updated_at"] = now_iso()
+                    self._rebuild_index()
                     self.save_config()
                     return conn
             return None
@@ -273,15 +320,8 @@ class RoutingMatrix:
         (라우팅 시 사용)
         """
         with self._lock:
-            return [
-                {
-                    "target": conn["target"],
-                    "transform": conn.get("transform", {}),
-                    "enabled": conn.get("enabled", True)
-                }
-                for conn in self._connections
-                if conn["source"] == source_port_id and conn.get("enabled", True)
-            ]
+            targets = self._targets_by_source.get(source_port_id, [])
+            return [t for t in targets if t.get("enabled", True)]
     
     def get_all_connections(self) -> List[Dict[str, Any]]:
         """모든 연결 목록"""
@@ -422,6 +462,68 @@ class PortRouter:
         """라우팅 통계"""
         with self._lock:
             return json.loads(json.dumps(self._stats))
+
+
+class AsyncPortRouter:
+    """
+    Queue-based router wrapper.
+    Keeps transport receive path fast by offloading routing work to worker threads.
+    """
+
+    def __init__(
+        self,
+        inner_router: PortRouter,
+        workers: int = 2,
+        queue_size: int = 5000
+    ):
+        self.inner_router = inner_router
+        self._q: queue.Queue = queue.Queue(maxsize=max(1, queue_size))
+        self._running = True
+        self._workers: List[threading.Thread] = []
+        self._stats = {
+            "queued": 0,
+            "processed": 0,
+            "enqueue_dropped": 0,
+            "queue_size": 0
+        }
+        self._lock = threading.Lock()
+
+        for i in range(max(1, workers)):
+            t = threading.Thread(target=self._worker_loop, name=f"route-worker-{i}", daemon=True)
+            t.start()
+            self._workers.append(t)
+
+    def _worker_loop(self):
+        while self._running:
+            try:
+                source_device_id, source_port_name, value = self._q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            try:
+                self.inner_router.route(source_device_id, source_port_name, value)
+            finally:
+                with self._lock:
+                    self._stats["processed"] += 1
+                    self._stats["queue_size"] = self._q.qsize()
+
+    def route(self, source_device_id: str, source_port_name: str, value: float) -> int:
+        try:
+            self._q.put_nowait((source_device_id, source_port_name, value))
+            with self._lock:
+                self._stats["queued"] += 1
+                self._stats["queue_size"] = self._q.qsize()
+            return 1
+        except queue.Full:
+            with self._lock:
+                self._stats["enqueue_dropped"] += 1
+            return 0
+
+    def get_stats(self) -> Dict[str, Any]:
+        out = self.inner_router.get_stats()
+        with self._lock:
+            out.update(json.loads(json.dumps(self._stats)))
+        return out
 
 
 # ========= 테스트용 =========

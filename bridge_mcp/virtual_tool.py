@@ -179,12 +179,13 @@ class VirtualToolExecutor:
     """가상 툴 실행을 담당"""
     
     def __init__(self, virtual_tool_store: VirtualToolStore, 
-                 device_store, cmd_waiter, mqtt_client_getter, ipc_agent=None):
+                 device_store, cmd_waiter, mqtt_client_getter, ipc_agent=None, command_service=None):
         self.store = virtual_tool_store
         self.device_store = device_store
         self.cmd_waiter = cmd_waiter
         self.mqtt_client_getter = mqtt_client_getter
         self.ipc_agent = ipc_agent
+        self.command_service = command_service
         self._executor = ThreadPoolExecutor(max_workers=10)
     
     def set_ipc_agent(self, ipc_agent):
@@ -265,6 +266,8 @@ class VirtualToolExecutor:
             
             # Submit to thread pool
             def execute_tool(dev_id, t_name, t_args):
+                if self.command_service:
+                    return self.command_service.execute(dev_id, t_name, t_args)
                 return publish_cmd(
                     self.device_store, 
                     self.cmd_waiter, 
